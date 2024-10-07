@@ -35,6 +35,9 @@
 
 #define DEFAULT_MODEL_PATH "models/7B/ggml-model-f16.gguf"
 
+struct llama_repeat_lora_adapter_info;
+
+struct llama_lazy_lora_adapter_container;
 struct llama_lora_adapter_info {
     std::string path;
     float scale;
@@ -167,6 +170,9 @@ struct gpt_params {
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_lora_adapter_apply)
     std::vector<llama_lora_adapter_info> lora_adapters; // lora adapter path with user defined scale
+    
+    std::vector<llama_repeat_lora_adapter_info> repeat_lora_adapters; // lora adapter path with user defined repeat times
+    int32_t active_lora_num = 10; // number of active lora adapters
 
     std::vector<llama_control_vector_load_info> control_vectors; // control vector with user defined scale
 
@@ -438,6 +444,7 @@ struct llama_init_result {
     struct llama_model   * model   = nullptr;
     struct llama_context * context = nullptr;
     std::vector<llama_lora_adapter_container> lora_adapters;
+    std::vector<llama_lazy_lora_adapter_container*> lazy_lora_adapters;
 };
 
 struct llama_init_result    llama_init_from_gpt_params(gpt_params & params);
@@ -451,6 +458,8 @@ struct llama_model * llama_load_model_from_hf(const char * repo, const char * fi
 
 // clear LoRA adapters from context, then apply new list of adapters
 void llama_lora_adapters_apply(struct llama_context * ctx, std::vector<llama_lora_adapter_container> & lora_adapters);
+
+void llama_lazy_lora_adapters_register(struct llama_context* ctx, std::vector<llama_lazy_lora_adapter_container*>& lazy_lora_adapters);
 
 // Batch utils
 

@@ -3176,7 +3176,7 @@ struct llama_sbatch {
 };
 
 struct llama_context {
-    llama_context(const llama_model & model)
+    llama_context(llama_model & model)
         : model(model)
         , t_start_us(model.t_start_us)
         , t_load_us(model.t_load_us) {}
@@ -3191,7 +3191,7 @@ struct llama_context {
         ggml_backend_buffer_free(buf_output);
     }
 
-    const struct llama_model & model;
+    struct llama_model & model;
 
     struct llama_cparams        cparams;
     struct llama_sbatch         sbatch;
@@ -3199,6 +3199,9 @@ struct llama_context {
     struct llama_control_vector cvec;
 
     std::unordered_map<struct llama_lora_adapter *, float> lora_adapters;
+    std::vector<struct llama_lazy_lora_adapter_container*> lazy_load_lora_adapters;
+
+    int32_t adapter_idx = -1;
 
     std::vector<ggml_backend_t> backends;
 #ifdef GGML_USE_METAL
@@ -3305,6 +3308,7 @@ struct llama_lora_adapter {
         if (ab_map.find(name) != ab_map.end()) {
             return &pos->second;
         }
+        // LLAMA_LOG_WARN("Cannot find tensor %s in lora adapter\n", name.c_str());
         return nullptr;
     }
 
@@ -8764,20 +8768,33 @@ static struct ggml_tensor * llm_build_lora_mm(
           struct ggml_tensor * w,
           struct ggml_tensor * cur) {
     struct ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
-    for (auto & it : lctx.lora_adapters) {
-        struct llama_lora_weight * lora = it.first->get_weight(w);
-        if (lora == nullptr) {
-            continue;
+    if (lctx.adapter_idx > 0) {
+        // LLAMA_LOG_INFO("llm_build_lora_mm: using lora adapter %d\n", lctx.adapter_idx);
+        auto& lora_adapter = lctx.lazy_load_lora_adapters[lctx.adapter_idx]->adapter;
+        struct llama_lora_weight* lora = lora_adapter->get_weight(w);
+        if (lora != nullptr) {
+            struct ggml_tensor * ab_cur = ggml_mul_mat(
+                ctx0, lora->b,
+                ggml_mul_mat(ctx0, lora->a, cur)
+            );
+            res = ggml_add(ctx0, res, ab_cur);
         }
-        const float alpha = it.first->alpha;
-        const float rank  = (float) lora->b->ne[0];
-        const float scale = alpha ? it.second * alpha / rank : it.second;
-        struct ggml_tensor * ab_cur = ggml_mul_mat(
-            ctx0, lora->b,
-            ggml_mul_mat(ctx0, lora->a, cur)
-        );
-        ab_cur = ggml_scale(ctx0, ab_cur, scale);
-        res = ggml_add(ctx0, res, ab_cur);
+    } else {
+        for (auto & it : lctx.lora_adapters) {
+            struct llama_lora_weight * lora = it.first->get_weight(w);
+            if (lora == nullptr) {
+                continue;
+            }
+            const float alpha = it.first->alpha;
+            const float rank  = (float) lora->b->ne[0];
+            const float scale = alpha ? it.second * alpha / rank : it.second;
+            struct ggml_tensor * ab_cur = ggml_mul_mat(
+                ctx0, lora->b,
+                ggml_mul_mat(ctx0, lora->a, cur)
+            );
+            ab_cur = ggml_scale(ctx0, ab_cur, scale);
+            res = ggml_add(ctx0, res, ab_cur);
+        }
     }
     return res;
 }
@@ -17863,6 +17880,77 @@ int32_t llama_lora_adapter_set(
         return -1;
     }
     ctx->lora_adapters[adapter] = scale;
+    return 0;
+}
+
+int32_t llama_lora_adapter_idx_set(struct llama_context* ctx,
+                                   int32_t adapter_idx) {
+    if ((int32_t)ctx->lazy_load_lora_adapters.size() <= adapter_idx) {
+        LLAMA_LOG_ERROR("%s: adapter index %d out of range\n", __func__, adapter_idx);
+        return -1;
+    }
+    LLAMA_LOG_INFO("%s: set adapter index %d\n", __func__, adapter_idx);
+    ctx->adapter_idx = adapter_idx;
+    return 0;
+}
+
+void llama_lora_adapter_release(struct llama_context* ctx,
+                                int32_t adapter_idx) {
+    if ((int32_t)ctx->lazy_load_lora_adapters.size() <= adapter_idx) {
+        LLAMA_LOG_ERROR("%s: adapter index %d out of range\n", __func__, adapter_idx);
+        return;
+    }
+    auto* lazy_lora_adapter = ctx->lazy_load_lora_adapters[adapter_idx];
+    lazy_lora_adapter->ref_count--;
+    LLAMA_LOG_INFO("%s: release adapter index %d, reference count %d\n", __func__, adapter_idx, lazy_lora_adapter->ref_count);
+}
+
+
+bool llama_lora_adapter_loaded(struct llama_context* ctx,
+                               int32_t adapter_idx){
+    if ((int32_t)ctx->lazy_load_lora_adapters.size() <= adapter_idx) {
+        LLAMA_LOG_ERROR("%s: adapter index %d out of range\n", __func__, adapter_idx);
+        return false;
+    }
+    auto* lazy_lora_adapter = ctx->lazy_load_lora_adapters[adapter_idx];
+    LLAMA_LOG_INFO("%s: adapter index %d, loaded %d\n", __func__, adapter_idx, lazy_lora_adapter->loaded);
+    return lazy_lora_adapter->loaded;
+}
+
+int32_t llama_lazy_load_lora_adapter(struct llama_context* ctx,
+                                     int32_t adapter_idx) {
+    if ((int32_t)ctx->lazy_load_lora_adapters.size() <= adapter_idx) {
+        LLAMA_LOG_ERROR("%s: adapter index %d out of range\n", __func__, adapter_idx);
+        return -1;
+    }
+    auto* lazy_lora_adapter = ctx->lazy_load_lora_adapters[adapter_idx];
+
+    if (lazy_lora_adapter->ref_count > 0) {
+        LLAMA_LOG_INFO("%s: adapter %d already loaded\n", __func__, adapter_idx);
+        lazy_lora_adapter->ref_count++;
+    } else {
+        LLAMA_LOG_INFO("%s: load adapter %d\n", __func__, adapter_idx);
+        lazy_lora_adapter->ref_count = 1;
+        // TODO(@zheyu): use LRU to unload unused adapter
+        // std::async(std::launch::async, [ctx, lazy_lora_adapter]() {
+        //     llama_lora_adapter_init(&(ctx->model), lazy_lora_adapter->path.c_str());
+        //     // After the initialization, set the adapter as loaded
+        //     lazy_lora_adapter->loaded = true;
+        // });
+        lazy_lora_adapter->adapter = llama_lora_adapter_init(&(ctx->model), lazy_lora_adapter->path.c_str());
+        lazy_lora_adapter->loaded = true;
+    }
+    return 0;
+}
+
+int32_t llama_lazy_lora_adapter_register(struct llama_context* ctx,
+                                         struct llama_lazy_lora_adapter_container* lazy_lora_adapter) {
+    if (ctx->cparams.flash_attn) {
+        LLAMA_LOG_ERROR("%s: flash_attn is not compatible with LoRA\n", __func__);
+        return -1;
+    }
+    LLAMA_LOG_INFO("%s: register lazy lora adapter\n", __func__);
+    ctx->lazy_load_lora_adapters.emplace_back(lazy_lora_adapter);
     return 0;
 }
 

@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <string>
 
 #ifdef LLAMA_SHARED
 #    if defined(_WIN32) && !defined(__MINGW32__)
@@ -385,6 +386,18 @@ extern "C" {
     // lora adapter
     struct llama_lora_adapter;
 
+    struct llama_repeat_lora_adapter_info {
+        std::string path;
+        int32_t repeat;
+    };
+
+    struct llama_lazy_lora_adapter_container {
+        std::string path;
+        struct llama_lora_adapter* adapter;
+        bool loaded;
+        uint32_t ref_count;
+    };
+
     // Helpers for getting default parameters
     // TODO: update API to start accepting pointers to params structs (https://github.com/ggerganov/llama.cpp/discussions/9172)
     LLAMA_API struct llama_model_params          llama_model_default_params(void);
@@ -511,6 +524,24 @@ extern "C" {
             struct llama_context * ctx,
             struct llama_lora_adapter * adapter,
             float scale);
+
+    LLAMA_API int32_t llama_lora_adapter_idx_set(struct llama_context* ctx,
+                                                 int32_t adapter_idx);
+
+    LLAMA_API void llama_lora_adapter_release(struct llama_context* ctx,
+                                              int32_t adapter_idx);
+
+    LLAMA_API bool llama_lora_adapter_loaded(
+        struct llama_context* ctx,
+        int32_t adapter_idx);
+
+    LLAMA_API int32_t llama_lazy_lora_adapter_register(
+        struct llama_context* ctx,
+        struct llama_lazy_lora_adapter_container* lazy_lora_adapter);
+
+    LLAMA_API int32_t llama_lazy_load_lora_adapter(
+        struct llama_context* ctx,
+        int32_t adapter_idx);
 
     // Remove a specific LoRA adapter from given context
     // Return -1 if the adapter is not present in the context

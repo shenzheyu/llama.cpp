@@ -115,6 +115,8 @@ struct slot_params {
     int32_t  n_discard =  0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half
     int32_t  n_predict = -1; // new tokens to predict
 
+    int32_t adapter_idx = -1; // lora adapter id (-1 for not using any adapter)
+
     std::vector<std::string> antiprompt;
 
     json input_prefix;
@@ -610,6 +612,7 @@ struct server_context {
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
     std::vector<llama_lora_adapter_container> lora_adapters;
+    std::vector<llama_lazy_lora_adapter_container*> lazy_lora_adapters;
 
     gpt_params params;
 
@@ -671,6 +674,7 @@ struct server_context {
         model = llama_init.model;
         ctx = llama_init.context;
         lora_adapters = llama_init.lora_adapters;
+        lazy_lora_adapters = llama_init.lazy_lora_adapters;
         params.n_parallel -= 1; // but be sneaky about it
         if (model == nullptr) {
             LOG_ERROR("unable to load model", {{"model", params.model}});
@@ -919,6 +923,7 @@ struct server_context {
         slot.sparams.seed              = json_value(data, "seed",              default_sparams.seed);
         slot.sparams.n_probs           = json_value(data, "n_probs",           default_sparams.n_probs);
         slot.sparams.min_keep          = json_value(data, "min_keep",          default_sparams.min_keep);
+        slot.params.adapter_idx        = json_value(data, "adapter_idx",       default_params.adapter_idx);
 
         // process "json_schema" and "grammar"
         if (data.contains("json_schema") && !data.at("json_schema").is_null() && data.contains("grammar") && !data.at("grammar").is_null()) {
@@ -1919,9 +1924,23 @@ struct server_context {
         // start populating the batch for this iteration
         llama_batch_clear(batch);
 
+        int32_t current_adapter_idx = -2;
+
         // frist, add sampled tokens from any ongoing sequences
         for (auto & slot : slots) {
             if (slot.state != SLOT_STATE_GENERATING) {
+                continue;
+            }
+
+            // make sure adapter_idx consistent in one batch
+            if (current_adapter_idx == -2) {
+                current_adapter_idx = slot.params.adapter_idx;
+                llama_lora_adapter_idx_set(ctx, current_adapter_idx);
+            } else if (current_adapter_idx != slot.params.adapter_idx) {
+                LOG_VERBOSE("adapter_idx inconsistency in one batch", {
+                    {"current_adapter_idx", current_adapter_idx},
+                    {"slot_adapter_idx",    slot.params.adapter_idx}
+                });
                 continue;
             }
 
@@ -1965,6 +1984,12 @@ struct server_context {
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT) {
                     auto & prompt_tokens = slot.prompt_tokens;
+
+                    // check if the adapter lora is loaded
+                    if (slot.params.adapter_idx != -1) {
+                        int32_t adapter_idx = slot.params.adapter_idx;
+                        llama_lazy_load_lora_adapter(ctx, adapter_idx);
+                    }
 
                     // we haven't tokenized the prompt yet - do it now:
                     if (prompt_tokens.empty()) {
@@ -2325,6 +2350,18 @@ struct server_context {
                         continue; // continue loop of slots
                     }
 
+                    int32_t adapter_idx = slot.params.adapter_idx;
+                    if (adapter_idx != -1) {
+                        if (!llama_lora_adapter_loaded(ctx, adapter_idx)) {
+                            LOG_ERROR("LORA adapter not loaded", {
+                                {"id_slot", slot.id},
+                                {"id_task", slot.id_task},
+                                {"adapter_idx", adapter_idx}
+                            });
+                            continue; // continue loop of slots
+                        }
+                    }
+
                     // prompt evaluated for next-token prediction
                     slot.state = SLOT_STATE_GENERATING;
                 } else if (slot.state != SLOT_STATE_GENERATING) {
@@ -2356,6 +2393,10 @@ struct server_context {
 
                 if (!process_token(result, slot)) {
                     // release slot because of stop condition
+                    int32_t adapter_idx = slot.params.adapter_idx;
+                    if (adapter_idx >= 0) {
+                        llama_lora_adapter_release(ctx, adapter_idx);
+                    }
                     slot.release();
                     slot.print_timings();
                     send_final_response(slot);

@@ -1815,6 +1815,22 @@ std::vector<llama_arg> gpt_params_parser_init(gpt_params & params, llama_example
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}));
     add_opt(llama_arg(
+        {"--lora-repeated"}, "FNAME", "REPEAT",
+        "path to LoRA adapter with user defined repeat (only one adapter can be used)\n"
+        "task need to specify adapter index to use",
+        [](gpt_params & params, const std::string & fname, const std::string & repeat) {
+            // params.repeat_lora_adapters.push_back({ fname, std::stoi(repeat) });
+            params.repeat_lora_adapters.push_back({fname, std::stoi(repeat)});
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}));
+    add_opt(llama_arg(
+        {"--active-lora-num"}, "N",
+        "number of active LoRA adapters (default: 1)",
+        [](gpt_params & params, int value) {
+            params.active_lora_num = value;
+        }
+    ));
+    add_opt(llama_arg(
         {"--control-vector"}, "FNAME",
         "add a control vector\nnote: this argument can be repeated to add multiple control vectors",
         [](gpt_params & params, const std::string & value) {
@@ -2717,6 +2733,18 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         }
         iparams.lora_adapters.push_back(loaded_la); // copy to list of loaded adapters
     }
+    for (auto & la : params.repeat_lora_adapters) {
+        fprintf(stdout, "repeating LoRA adapter %s %d times\n", la.path.c_str(), la.repeat);
+        for (int i = 0; i < la.repeat; i++) {
+            llama_lazy_lora_adapter_container* lazy_la = new llama_lazy_lora_adapter_container();
+            lazy_la->path = la.path;
+            lazy_la->adapter = nullptr;
+            lazy_la->loaded = false;
+            lazy_la->ref_count = 0;
+            iparams.lazy_lora_adapters.emplace_back(lazy_la);
+        }
+    }
+    llama_lazy_lora_adapters_register(lctx, iparams.lazy_lora_adapters);
     if (!params.lora_init_without_apply) {
         llama_lora_adapters_apply(lctx, iparams.lora_adapters);
     }
@@ -2771,6 +2799,13 @@ void llama_lora_adapters_apply(struct llama_context * ctx, std::vector<llama_lor
         if (la.scale != 0.0f) {
             llama_lora_adapter_set(ctx, la.adapter, la.scale);
         }
+    }
+}
+
+void llama_lazy_lora_adapters_register(struct llama_context* ctx, std::vector<llama_lazy_lora_adapter_container*>& lazy_lora_adapters) {
+    for (auto& lla : lazy_lora_adapters) {
+        fprintf(stdout, "registering LoRA adapter %s\n", lla->path.c_str());
+        llama_lazy_lora_adapter_register(ctx, lla);
     }
 }
 

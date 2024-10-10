@@ -3315,6 +3315,18 @@ struct llama_lora_adapter {
         return nullptr;
     }
 
+    void clear() {
+        for (struct ggml_context * ctx : ctxs) {
+            ggml_free(ctx);
+        }
+        for (ggml_backend_buffer_t buf : bufs) {
+            ggml_backend_buffer_free(buf);
+        }
+        ctxs.clear();
+        bufs.clear();
+        ab_map.clear();
+    }
+
     ~llama_lora_adapter() {
         for (struct ggml_context * ctx : ctxs) {
             ggml_free(ctx);
@@ -18480,7 +18492,7 @@ struct llama_context * llama_new_context_with_model(
         }
 #endif
 
-        ctx->lora_cache = new LlamaLoraLRUCache(params.adapter_cache_size);
+        ctx->lora_cache = new LlamaLoraLRUCache(params.adapter_cache_size, model);
 
         ctx->backend_cpu = ggml_backend_cpu_init();
         if (ctx->backend_cpu == nullptr) {
@@ -18826,7 +18838,13 @@ uint32_t llama_model_quantize(
     }
 }
 
-LlamaLoraLRUCache::LlamaLoraLRUCache(size_t capacity) : capacity(capacity) {};
+LlamaLoraLRUCache::LlamaLoraLRUCache(size_t capacity, struct llama_model* model) : 
+    capacity(capacity) {
+    // Pre-allocate adapters and push them to the memory pool
+    for (size_t i = 0; i < capacity; ++i) {
+        memory_pool.push(std::make_shared<llama_lora_adapter>(model));
+    }
+};
 
 std::shared_ptr<llama_lora_adapter> LlamaLoraLRUCache::get(size_t adapter_idx, struct llama_model* model, const char* path_lora) {
     // If the adapter is already in the cache, move it to the front
@@ -18846,12 +18864,21 @@ std::shared_ptr<llama_lora_adapter> LlamaLoraLRUCache::load_adapter(size_t adapt
     if (adapter_cache.size() >= capacity) {
         auto lru = adapter_cache.back();
         cache_set.erase(lru.first);
+        lru.second.get()->clear();
+        memory_pool.push(lru.second); // Return the adapter to the memory pool
         adapter_cache.pop_back();
         LLAMA_LOG_INFO("Evicted adapter with ID: %ld\n", lru.first);
     }
 
-    // Create a new adapter and add it to the front of the list
-    struct llama_lora_adapter* adapter = new llama_lora_adapter(model);
+    // Get an adapter from the memory pool
+    std::shared_ptr<llama_lora_adapter> adapter;
+    if (!memory_pool.empty()) {
+        adapter = memory_pool.top();
+        memory_pool.pop();
+    } else {
+        LLAMA_LOG_ERROR("Memory pool is empty\n");
+    }
+
     llama_lora_adapter_init_internal(model, path_lora, *adapter);
     auto new_adapter = std::shared_ptr<llama_lora_adapter>(adapter);
     adapter_cache.emplace_front(adapter_idx, new_adapter);

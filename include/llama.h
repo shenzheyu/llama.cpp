@@ -7,6 +7,7 @@
 #include <atomic>
 #include <list>
 #include <memory>
+#include <stack>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -407,7 +408,7 @@ extern "C" {
 
     class LlamaLoraLRUCache {
     public:
-        LlamaLoraLRUCache(size_t capacity);
+        LlamaLoraLRUCache(size_t capacity, struct llama_model* model);
 
         // Access an adapter
         std::shared_ptr<llama_lora_adapter> get(size_t adapter_idx, struct llama_model* model, const char* path_lora);
@@ -416,6 +417,7 @@ extern "C" {
         size_t capacity;
         std::list<std::pair<size_t, std::shared_ptr<llama_lora_adapter>>> adapter_cache; // Maintain the ordering of access
         std::unordered_set<size_t> cache_set; // Set to track the adapters in the list
+        std::stack<std::shared_ptr<llama_lora_adapter>> memory_pool; // Memory pool for adapters
 
         // Load a new adapter 
         std::shared_ptr<llama_lora_adapter> load_adapter(size_t adapter_idx, struct llama_model* model, const char* path_lora);

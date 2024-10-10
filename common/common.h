@@ -172,7 +172,7 @@ struct gpt_params {
     std::vector<llama_lora_adapter_info> lora_adapters; // lora adapter path with user defined scale
     
     std::vector<llama_repeat_lora_adapter_info> repeat_lora_adapters; // lora adapter path with user defined repeat times
-    int32_t active_lora_num = 10; // number of active lora adapters
+    int32_t adapter_cache_size = 10; // number of active lora adapters
 
     std::vector<llama_control_vector_load_info> control_vectors; // control vector with user defined scale
 

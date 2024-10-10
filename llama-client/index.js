@@ -5,8 +5,8 @@ async function Test() {
         method: 'POST',
         body: JSON.stringify({
             prompt,
-            n_predict: 512,
-            adapter_idx: 1,
+            n_predict: 8,
+            adapter_idx: 2,
         })
     })
     console.log((await response.json()).content)

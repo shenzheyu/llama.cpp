@@ -84,6 +84,7 @@
 #include <functional>
 #include <future>
 #include <initializer_list>
+#include <list>
 #include <locale>
 #include <map>
 #include <memory>
@@ -94,6 +95,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -3202,6 +3204,7 @@ struct llama_context {
     std::vector<struct llama_lazy_lora_adapter_container*> lazy_load_lora_adapters;
 
     int32_t adapter_idx = -1;
+    LlamaLoraLRUCache* lora_cache = nullptr;
 
     std::vector<ggml_backend_t> backends;
 #ifdef GGML_USE_METAL
@@ -17913,7 +17916,11 @@ bool llama_lora_adapter_loaded(struct llama_context* ctx,
         return false;
     }
     auto* lazy_lora_adapter = ctx->lazy_load_lora_adapters[adapter_idx];
-    LLAMA_LOG_INFO("%s: adapter index %d, loaded %d\n", __func__, adapter_idx, lazy_lora_adapter->loaded);
+    if (lazy_lora_adapter->loaded) {
+        LLAMA_LOG_INFO("%s: adapter index %d, loaded\n", __func__, adapter_idx);
+    } else {
+        LLAMA_LOG_INFO("%s: adapter index %d, unloaded\n", __func__, adapter_idx);
+    }
     return lazy_lora_adapter->loaded;
 }
 
@@ -17931,13 +17938,19 @@ int32_t llama_lazy_load_lora_adapter(struct llama_context* ctx,
     } else {
         LLAMA_LOG_INFO("%s: load adapter %d\n", __func__, adapter_idx);
         lazy_lora_adapter->ref_count = 1;
-        // TODO(@zheyu): use LRU to unload unused adapter
-        // std::async(std::launch::async, [ctx, lazy_lora_adapter]() {
-        //     llama_lora_adapter_init(&(ctx->model), lazy_lora_adapter->path.c_str());
-        //     // After the initialization, set the adapter as loaded
-        //     lazy_lora_adapter->loaded = true;
-        // });
-        lazy_lora_adapter->adapter = llama_lora_adapter_init(&(ctx->model), lazy_lora_adapter->path.c_str());
+        // Use LRU to unload unused adapter
+        if (ctx->lora_cache != nullptr) {
+            lazy_lora_adapter->adapter = ctx->lora_cache->get((size_t)adapter_idx,
+                                                              &(ctx->model),
+                                                              lazy_lora_adapter->path.c_str()).get();
+        } else {
+            // std::async(std::launch::async, [ctx, lazy_lora_adapter]() {
+            //     llama_lora_adapter_init(&(ctx->model), lazy_lora_adapter->path.c_str());
+            //     // After the initialization, set the adapter as loaded
+            //     lazy_lora_adapter->loaded = true;
+            // });
+            lazy_lora_adapter->adapter = llama_lora_adapter_init(&(ctx->model), lazy_lora_adapter->path.c_str());
+        }
         lazy_lora_adapter->loaded = true;
     }
     return 0;
@@ -18021,6 +18034,7 @@ struct llama_context_params llama_context_default_params() {
         /*.defrag_thold                =*/ -1.0f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
+        /*.adapter_cache_size          =*/ 10,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.logits_all                  =*/ false,
@@ -18466,6 +18480,8 @@ struct llama_context * llama_new_context_with_model(
         }
 #endif
 
+        ctx->lora_cache = new LlamaLoraLRUCache(params.adapter_cache_size);
+
         ctx->backend_cpu = ggml_backend_cpu_init();
         if (ctx->backend_cpu == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to initialize CPU backend\n", __func__);
@@ -18809,6 +18825,41 @@ uint32_t llama_model_quantize(
         return 1;
     }
 }
+
+LlamaLoraLRUCache::LlamaLoraLRUCache(size_t capacity) : capacity(capacity) {};
+
+std::shared_ptr<llama_lora_adapter> LlamaLoraLRUCache::get(size_t adapter_idx, struct llama_model* model, const char* path_lora) {
+    // If the adapter is already in the cache, move it to the front
+    if (cache_set.find(adapter_idx) != cache_set.end()) {
+        auto list_it = std::find_if(adapter_cache.begin(), adapter_cache.end(), 
+                                [adapter_idx](const std::pair<size_t, std::shared_ptr<llama_lora_adapter>>& pair) { return pair.first == adapter_idx; });
+        adapter_cache.splice(adapter_cache.begin(), adapter_cache, list_it);
+        return list_it->second;
+    }
+
+    // If the adapter is not in the cache, create/load it
+    return load_adapter(adapter_idx, model, path_lora);
+};
+
+std::shared_ptr<llama_lora_adapter> LlamaLoraLRUCache::load_adapter(size_t adapter_idx, struct llama_model* model, const char* path_lora) {
+    // If we have reached capacity, remove the least recently used adapter
+    if (adapter_cache.size() >= capacity) {
+        auto lru = adapter_cache.back();
+        cache_set.erase(lru.first);
+        adapter_cache.pop_back();
+        LLAMA_LOG_INFO("Evicted adapter with ID: %ld\n", lru.first);
+    }
+
+    // Create a new adapter and add it to the front of the list
+    struct llama_lora_adapter* adapter = new llama_lora_adapter(model);
+    llama_lora_adapter_init_internal(model, path_lora, *adapter);
+    auto new_adapter = std::shared_ptr<llama_lora_adapter>(adapter);
+    adapter_cache.emplace_front(adapter_idx, new_adapter);
+    cache_set.insert(adapter_idx);
+
+    LLAMA_LOG_INFO("Loaded adapter with ID: %ld\n", adapter_idx);
+    return new_adapter;
+};
 
 struct llama_lora_adapter * llama_lora_adapter_init(struct llama_model * model, const char * path_lora) {
     try {

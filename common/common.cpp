@@ -1824,10 +1824,10 @@ std::vector<llama_arg> gpt_params_parser_init(gpt_params & params, llama_example
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}));
     add_opt(llama_arg(
-        {"--active-lora-num"}, "N",
-        "number of active LoRA adapters (default: 1)",
+        {"--adapter-cache-size"}, "N",
+        "number of active LoRA adapters (default: 10)",
         [](gpt_params & params, int value) {
-            params.active_lora_num = value;
+            params.adapter_cache_size = value;
         }
     ));
     add_opt(llama_arg(
@@ -2888,6 +2888,7 @@ struct llama_context_params llama_context_params_from_gpt_params(const gpt_param
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.flash_attn        = params.flash_attn;
+    cparams.adapter_cache_size = (size_t)params.adapter_cache_size;
 
     cparams.type_k = kv_cache_type_from_str(params.cache_type_k);
     cparams.type_v = kv_cache_type_from_str(params.cache_type_v);

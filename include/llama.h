@@ -4,11 +4,15 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <atomic>
+#include <list>
+#include <memory>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <string>
+#include <unordered_set>
 
 #ifdef LLAMA_SHARED
 #    if defined(_WIN32) && !defined(__MINGW32__)
@@ -335,6 +339,9 @@ extern "C" {
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
+        // Multi Lora adapter
+        size_t adapter_cache_size;
+
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
@@ -394,8 +401,24 @@ extern "C" {
     struct llama_lazy_lora_adapter_container {
         std::string path;
         struct llama_lora_adapter* adapter;
-        bool loaded;
+        std::atomic<bool> loaded;
         uint32_t ref_count;
+    };
+
+    class LlamaLoraLRUCache {
+    public:
+        LlamaLoraLRUCache(size_t capacity);
+
+        // Access an adapter
+        std::shared_ptr<llama_lora_adapter> get(size_t adapter_idx, struct llama_model* model, const char* path_lora);
+
+    private:
+        size_t capacity;
+        std::list<std::pair<size_t, std::shared_ptr<llama_lora_adapter>>> adapter_cache; // Maintain the ordering of access
+        std::unordered_set<size_t> cache_set; // Set to track the adapters in the list
+
+        // Load a new adapter 
+        std::shared_ptr<llama_lora_adapter> load_adapter(size_t adapter_idx, struct llama_model* model, const char* path_lora);
     };
 
     // Helpers for getting default parameters

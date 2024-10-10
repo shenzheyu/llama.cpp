@@ -8,7 +8,7 @@ make -j8 llama-server
 # Start server
 
 ```
-./llama-server -m [model_file_path] -c 2048 --lora_repeated [lora_file_path] 10
+./llama-server -m [model_file_path] -c 2048 --lora_repeated [lora_file_path] 20 --adapter_cache_size 10
 ```
 
 # API example

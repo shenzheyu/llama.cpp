@@ -192,6 +192,7 @@ struct server_slot {
 
     double t_prompt_processing; // ms
     double t_token_generation; // ms
+    double t_first_token; // ms
 
     std::function<void(int)> callback_on_release;
 
@@ -339,6 +340,7 @@ struct server_slot {
             {"t_prompt_processing", t_prompt_processing},
             {"t_token_generation",  t_token_generation},
             {"t_total",             t_prompt_processing + t_token_generation},
+            {"t_first_token",       t_first_token},
         });
     }
 };
@@ -1615,6 +1617,7 @@ struct server_context {
                     slot->id_task   = task.id;
                     slot->cmpl_type = task.cmpl_type;
                     slot->index     = json_value(task.data, "index", 0);
+                    slot->t_first_token = ggml_time_us();
 
                     if (!launch_slot_with_task(*slot, task)) {
                         LOG_ERROR("error while launching slot", task.data);
@@ -2377,6 +2380,7 @@ struct server_context {
                 if (slot.n_decoded == 1) {
                     slot.t_start_generation = ggml_time_us();
                     slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                    slot.t_first_token = (slot.t_first_token - ggml_time_us()) / 1e3;
                     metrics.on_prompt_eval(slot);
                 }
 

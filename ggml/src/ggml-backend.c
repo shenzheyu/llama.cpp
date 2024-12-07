@@ -1218,7 +1218,7 @@ static char * fmt_size(size_t size) {
 
 static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     int cur_split = 0;
-    for (int i = 0; i < graph->n_nodes; i++) {
+    for (int i = 0; i < 100; i++) {
         if (cur_split < sched->n_splits && i == sched->splits[cur_split].i_start) {
             ggml_backend_t split_backend = sched->backends[sched->splits[cur_split].backend_id];
             fprintf(stderr, "\n## SPLIT #%d: %s # %d inputs: ", cur_split, ggml_backend_name(split_backend),
@@ -1243,7 +1243,7 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
                 continue;
             }
             ggml_backend_t src_backend = ggml_backend_sched_get_tensor_backend(sched, src);
-            fprintf(stderr, " %20.20s (%5.5s) [%5.5s %8.8s]", src->name,
+            fprintf(stderr, " %30.30s (%5.5s) [%5.5s %8.8s]", src->name,
                 fmt_size(ggml_nbytes(src)), src_backend ? ggml_backend_name(src_backend) : "NULL", GET_CAUSE(src));
         }
         fprintf(stderr, "\n");
@@ -1276,6 +1276,20 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
         *node_backend_id = cur_backend_id;
         SET_CAUSE(node, "2.sup");
     }
+}
+
+static bool is_lora_tensor(const struct ggml_tensor* node) {
+    // Example: Check if src tensor name contains "lora"
+    for (int j = 0; j < GGML_MAX_SRC; j++) {
+        struct ggml_tensor * src = node->src[j];
+        if (src == NULL) {
+            continue;
+        }
+        if (src->name && strstr(src->name, "lora") != NULL) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
@@ -1333,6 +1347,11 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
             }
 #endif
         }
+    }
+
+    if (sched->debug) {
+        printf("graph after pass 1:\n");
+        ggml_backend_sched_print_assignments(sched, graph);
     }
 
     // pass 2: expand current backend assignments
@@ -1415,6 +1434,39 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
         }
     }
 
+    if (sched->debug) {
+        printf("graph after pass 2:\n");
+        ggml_backend_sched_print_assignments(sched, graph);
+    }
+
+    // Explicitly assign LoRA tensors to CPU backend
+    // {
+    //     for (int i = 0; i < graph->n_nodes; i++) {
+    //         struct ggml_tensor * node = graph->nodes[i];
+    //         // Check if the tensor is a LoRA tensor
+    //         if (is_lora_tensor(node)) {
+    //             int* node_backend_id = &tensor_backend_id(node);
+    //             for (int j = 0; j < GGML_MAX_SRC; j++) {
+    //                 struct ggml_tensor * src = node->src[j];
+    //                 if (src == NULL) {
+    //                     continue;
+    //                 }
+    //                 if (src->name && strstr(src->name, "lora") != NULL) {
+    //                     int cur_backend_id = tensor_backend_id(src);
+    //                     // int cur_backend_id = 1; // CPU backend
+    //                     ggml_backend_sched_set_if_supported(sched, node, cur_backend_id, node_backend_id);
+    //                     break;
+    //                 }
+    //             }
+    //         }
+    //     }
+    // }
+
+    if (sched->debug) {
+        printf("explicitly assign LoRA tensors to CPU backend:\n");
+        ggml_backend_sched_print_assignments(sched, graph);
+    }
+
     // pass 3: upgrade nodes to higher prio backends with compatible buffer types
     // if the tensor is already in the same buffer type (*) as another higher priority backend, we should move it there
     // however, we also need to verify that the sources are in compatible buffer types
@@ -1476,6 +1528,11 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
         }
     }
 
+    if (sched->debug) {
+        printf("graph after pass 3:\n");
+        ggml_backend_sched_print_assignments(sched, graph);
+    }
+
     // pass 4: assign backends to remaining src from dst and view_src
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
@@ -1501,6 +1558,11 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                 }
             }
         }
+    }
+
+    if (sched->debug) {
+        printf("graph after pass 4:\n");
+        ggml_backend_sched_print_assignments(sched, graph);
     }
 
     // pass 5: split graph, find tensors that need to be copied
@@ -1639,6 +1701,7 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
     }
 
     if (sched->debug) {
+        printf("graph after pass 5:\n");
         ggml_backend_sched_print_assignments(sched, graph);
     }
 

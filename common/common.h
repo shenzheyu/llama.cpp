@@ -170,9 +170,12 @@ struct gpt_params {
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_lora_adapter_apply)
     std::vector<llama_lora_adapter_info> lora_adapters; // lora adapter path with user defined scale
-    
-    std::vector<llama_repeat_lora_adapter_info> repeat_lora_adapters; // lora adapter path with user defined repeat times
-    int32_t adapter_cache_size = 10; // number of active lora adapters
+
+    std::vector<llama_repeat_lora_adapter_info>
+        repeat_lora_adapters;  // lora adapter path with user defined repeat
+                               // times
+    int32_t adapter_cache_size = 10;  // number of active lora adapters
+    bool batch_lora = false;          // apply lora to the batch
 
     std::vector<llama_control_vector_load_info> control_vectors; // control vector with user defined scale
 
@@ -465,12 +468,9 @@ void llama_lazy_lora_adapters_register(struct llama_context* ctx, std::vector<ll
 
 void llama_batch_clear(struct llama_batch & batch);
 
-void llama_batch_add(
-                 struct llama_batch & batch,
-                        llama_token   id,
-                          llama_pos   pos,
-    const std::vector<llama_seq_id> & seq_ids,
-                               bool   logits);
+void llama_batch_add(struct llama_batch &batch, llama_token id, llama_pos pos,
+                     const std::vector<llama_seq_id> &seq_ids, bool logits,
+                     int32_t adapter_id);
 
 //
 // Vocab utils

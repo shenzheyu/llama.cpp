@@ -238,6 +238,7 @@ extern "C" {
     // - pos    : the positions of the respective token in the sequence
     // - seq_id : the sequence to which the respective token belongs
     // - logits : if zero, the logits (and/or the embeddings) for the respective token will not be output
+    // - adapter_id : the adapter id to use for the respective token
     //
     typedef struct llama_batch {
         int32_t n_tokens;
@@ -248,6 +249,7 @@ extern "C" {
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;
         int8_t       *  logits; // TODO: rename this to "output"
+        int32_t      *  adapter_id;
 
         // NOTE: helpers for smooth API transition - can be deprecated in the future
         //       for future-proof code, use the above fields instead and ignore everything below
@@ -342,6 +344,7 @@ extern "C" {
 
         // Multi Lora adapter
         size_t adapter_cache_size;
+        bool batch_lora;
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
@@ -411,7 +414,7 @@ extern "C" {
         LlamaLoraLRUCache(size_t capacity, struct llama_model* model);
 
         // Access an adapter
-        std::shared_ptr<llama_lora_adapter> get(size_t adapter_idx, struct llama_model* model, const char* path_lora);
+        std::shared_ptr<llama_lora_adapter> get(size_t adapter_id, struct llama_model* model, const char* path_lora);
 
     private:
         size_t capacity;
@@ -420,7 +423,7 @@ extern "C" {
         std::stack<std::shared_ptr<llama_lora_adapter>> memory_pool; // Memory pool for adapters
 
         // Load a new adapter 
-        std::shared_ptr<llama_lora_adapter> load_adapter(size_t adapter_idx, struct llama_model* model, const char* path_lora);
+        std::shared_ptr<llama_lora_adapter> load_adapter(size_t adapter_id, struct llama_model* model, const char* path_lora);
     };
 
     // Helpers for getting default parameters
@@ -550,15 +553,21 @@ extern "C" {
             struct llama_lora_adapter * adapter,
             float scale);
 
-    LLAMA_API int32_t llama_lora_adapter_idx_set(struct llama_context* ctx,
-                                                 int32_t adapter_idx);
+    LLAMA_API int32_t llama_lora_adapter_id_set(struct llama_context* ctx,
+                                                 int32_t adapter_id);
+
+    LLAMA_API bool llama_lora_adapter_id_append(struct llama_context* ctx,
+                                                 int32_t adapter_id);
+
+    LLAMA_API bool llama_batch_lora_clear(struct llama_context* ctx,
+                                          int32_t n_parallel);
 
     LLAMA_API void llama_lora_adapter_release(struct llama_context* ctx,
-                                              int32_t adapter_idx);
+                                              int32_t adapter_id);
 
     LLAMA_API bool llama_lora_adapter_loaded(
         struct llama_context* ctx,
-        int32_t adapter_idx);
+        int32_t adapter_id);
 
     LLAMA_API int32_t llama_lazy_lora_adapter_register(
         struct llama_context* ctx,
@@ -566,7 +575,7 @@ extern "C" {
 
     LLAMA_API int32_t llama_lazy_load_lora_adapter(
         struct llama_context* ctx,
-        int32_t adapter_idx);
+        int32_t adapter_id);
 
     // Remove a specific LoRA adapter from given context
     // Return -1 if the adapter is not present in the context

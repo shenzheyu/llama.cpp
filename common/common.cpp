@@ -1824,6 +1824,13 @@ std::vector<llama_arg> gpt_params_parser_init(gpt_params & params, llama_example
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}));
     add_opt(llama_arg(
+        {"--batch-lora"}, "true|false",
+        "enable batched LoRA adapter (default: false)",
+        [](gpt_params & params, const std::string & value) {
+            params.batch_lora = (value == "true");
+        }
+    ));
+    add_opt(llama_arg(
         {"--adapter-cache-size"}, "N",
         "number of active LoRA adapters (default: 10)",
         [](gpt_params & params, int value) {
@@ -2889,6 +2896,7 @@ struct llama_context_params llama_context_params_from_gpt_params(const gpt_param
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.flash_attn        = params.flash_attn;
     cparams.adapter_cache_size = (size_t)params.adapter_cache_size;
+    cparams.batch_lora        = params.batch_lora;
 
     cparams.type_k = kv_cache_type_from_str(params.cache_type_k);
     cparams.type_v = kv_cache_type_from_str(params.cache_type_v);
@@ -3270,20 +3278,17 @@ void llama_batch_clear(struct llama_batch & batch) {
     batch.n_tokens = 0;
 }
 
-void llama_batch_add(
-                 struct llama_batch & batch,
-                        llama_token   id,
-                          llama_pos   pos,
-    const std::vector<llama_seq_id> & seq_ids,
-                               bool   logits) {
-    batch.token   [batch.n_tokens] = id;
-    batch.pos     [batch.n_tokens] = pos;
+void llama_batch_add(struct llama_batch &batch, llama_token id, llama_pos pos,
+                     const std::vector<llama_seq_id> &seq_ids, bool logits,
+                     int32_t adapter_id) {
+    batch.token[batch.n_tokens] = id;
+    batch.pos[batch.n_tokens] = pos;
     batch.n_seq_id[batch.n_tokens] = seq_ids.size();
     for (size_t i = 0; i < seq_ids.size(); ++i) {
         batch.seq_id[batch.n_tokens][i] = seq_ids[i];
     }
-    batch.logits  [batch.n_tokens] = logits;
-
+    batch.logits[batch.n_tokens] = logits;
+    batch.adapter_id[batch.n_tokens] = adapter_id;
     batch.n_tokens++;
 }
 

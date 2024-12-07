@@ -2654,6 +2654,8 @@ struct llama_ubatch {
     int32_t      *  n_seq_id; // [n_seqs]
     llama_seq_id ** seq_id;   // [n_seqs]
     int8_t       *  output;   // [n_tokens]
+
+    int32_t *adapter_id;
 };
 
 struct llama_kv_cell {
@@ -2848,6 +2850,7 @@ struct llama_sbatch_seq {
     llama_seq_id * seq_id;
     size_t offset;
     size_t length;
+    int32_t adapter_id;
 
     // helper for smoother batch API transition -- can be deprecated in the future
     llama_seq_id all_seq_id; // used if seq_id == NULL
@@ -2876,6 +2879,7 @@ struct llama_sbatch {
     std::vector<int32_t>        ubatch_n_seq_id;
     std::vector<llama_seq_id *> ubatch_seq_id;
     std::vector<int8_t>         ubatch_output;
+    std::vector<int32_t>        ubatch_adapter_id;
 
     llama_ubatch reserve_ubatch(size_t n_ubatch, bool has_embd = false) {
         // clear empty sequences
@@ -2894,6 +2898,7 @@ struct llama_sbatch {
         ubatch_n_seq_id.resize(n_ubatch);
         ubatch_seq_id.resize(n_ubatch);
         ubatch_output.resize(n_ubatch);
+        ubatch_adapter_id.resize(n_ubatch);
         llama_ubatch ubatch = {
             /*equal_seqs   =*/ true,
             /*n_tokens     =*/ 0,
@@ -2905,6 +2910,7 @@ struct llama_sbatch {
             /*n_seq_id     =*/ ubatch_n_seq_id.data(),
             /*seq_id       =*/ ubatch_seq_id.data(),
             /*output       =*/ ubatch_output.data(),
+            /*adapter_id   =*/ ubatch_adapter_id.data(),
         };
         return ubatch;
     }
@@ -3020,6 +3026,22 @@ struct llama_sbatch {
                 if (is_last) { out_ids.push_back(id); }
             }
         }
+
+        // Add adapter_id to the ubatch
+        if (ubatch.equal_seqs) {
+            ubatch.adapter_id[ubatch.n_seqs] = seq.adapter_id;
+        } else {
+            if (batch->adapter_id) {
+                for (size_t i = 0; i < length; ++i) {
+                    ubatch.adapter_id[i] = batch->adapter_id[seq.offset + i];
+                }
+            } else {
+                for (size_t i = 0; i < length; ++i) {
+                    ubatch.adapter_id[i] = seq.adapter_id;
+                }
+            }
+        }
+
         if (ubatch.n_tokens == 0 && ubatch.n_seqs == 0) {
             ubatch.n_seq_tokens = ubatch.equal_seqs ? length : 1;
         }
@@ -3157,12 +3179,13 @@ struct llama_sbatch {
                         continue;
                     }
                 }
-                llama_sbatch_seq new_seq = {n_seqs, seq_ids, i, 1, batch.all_seq_id};
+                const int32_t adapter_id = batch.adapter_id[bi];
+                llama_sbatch_seq new_seq = {n_seqs, seq_ids, i, 1, adapter_id, batch.all_seq_id};
                 seq.push_back(new_seq);
                 last_seq = &seq.back();
             }
         } else {
-            llama_sbatch_seq new_seq = {1, nullptr, 0, n_tokens, batch.all_seq_id};
+            llama_sbatch_seq new_seq = {1, nullptr, 0, n_tokens, -1, batch.all_seq_id};
             seq.push_back(new_seq);
         }
         // keep shared prompts first at the end, then sort by length descending.
@@ -3203,7 +3226,9 @@ struct llama_context {
     std::unordered_map<struct llama_lora_adapter *, float> lora_adapters;
     std::vector<struct llama_lazy_lora_adapter_container*> lazy_load_lora_adapters;
 
-    int32_t adapter_idx = -1;
+    int32_t adapter_id = -1;
+    std::vector<int32_t> adapter_ids;
+    bool batch_lora = false;
     LlamaLoraLRUCache* lora_cache = nullptr;
 
     std::vector<ggml_backend_t> backends;
@@ -4262,7 +4287,7 @@ namespace GGUFMeta {
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
 static size_t llama_model_max_nodes(const llama_model & model) {
-    return std::max<size_t>(8192, model.tensors_by_name.size()*5);
+    return std::max<size_t>(8192*10, model.tensors_by_name.size()*10);
 }
 
 struct llama_model_loader {
@@ -8722,7 +8747,13 @@ static struct ggml_tensor * llm_build_inp_embd(
 
         inpL = ggml_get_rows(ctx, tok_embd, lctx.inp_tokens);
     } else {
-       lctx.inp_embd = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, batch.n_tokens);
+        lctx.adapter_ids.clear();
+        if (batch.adapter_id) {
+            for (size_t i = 0; i < batch.n_tokens; ++i) {
+                lctx.adapter_ids.push_back(batch.adapter_id[i]);
+            }
+        }
+        lctx.inp_embd = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, batch.n_tokens);
         inpL = lctx.inp_embd;
         ggml_set_input(lctx.inp_embd);
     }
@@ -8777,36 +8808,141 @@ static void llm_build_kv_store(
 }
 
 // do mat_mul, while optionally apply lora
-static struct ggml_tensor * llm_build_lora_mm(
-        struct llama_context & lctx,
-         struct ggml_context * ctx0,
-          struct ggml_tensor * w,
-          struct ggml_tensor * cur) {
-    struct ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
-    if (lctx.adapter_idx > 0) {
-        // LLAMA_LOG_INFO("llm_build_lora_mm: using lora adapter %d\n", lctx.adapter_idx);
-        auto& lora_adapter = lctx.lazy_load_lora_adapters[lctx.adapter_idx]->adapter;
-        struct llama_lora_weight* lora = lora_adapter->get_weight(w);
+static struct ggml_tensor *llm_build_lora_mm(struct llama_context &lctx,
+                                             struct ggml_context *ctx0,
+                                             struct ggml_tensor *w,
+                                             struct ggml_tensor *cur) {
+    // cur is a 2D tensor with shape [n_embd, n_batch]
+    // w is a 2D tensor with shape [n_embd, n_embd]
+    struct ggml_tensor *res = ggml_mul_mat(ctx0, w, cur);
+    int n = cur->ne[1];  // Assuming ne[1] represents batch size
+    if (lctx.batch_lora && lctx.adapter_ids.size() == n) {
+        // Assuming cur has batch size n, and lctx.adapter_ids contains n
+        // indices
+
+        // struct ggml_tensor *ab_cur = ggml_new_tensor_2d(ctx0, res->type,
+        //     res->ne[0], res->ne[1]);
+
+        // for (int i = 0; i < n; ++i) {
+        //     int adapter_id = lctx.adapter_ids[i];
+
+        //     if (adapter_id > 0) {
+        //         auto &lora_adapter =
+        //             lctx.lazy_load_lora_adapters[adapter_id]->adapter;
+        //         struct llama_lora_weight *lora = lora_adapter->get_weight(w);
+
+        //         if (lora != nullptr) {
+        //             // Extract current sample from cur (assuming ggml_view_1d
+        //             // can extract the ith column)
+        //             struct ggml_tensor *cur_sample =
+        //                 ggml_view_1d(ctx0, cur, cur->ne[0], i * cur->nb[1]);
+
+        //             // Perform LoRA adapter computation for the current sample
+        //             struct ggml_tensor *ab_cur_sample = 
+        //                 ggml_view_1d(ctx0, ab_cur, ab_cur->ne[0], i * ab_cur->nb[1]);
+                    
+        //             ab_cur_sample = ggml_mul_mat(
+        //                 ctx0, lora->b, ggml_mul_mat(ctx0, lora->a, cur_sample));
+        //         }
+        //     }
+        // }
+        // res = ggml_add(ctx0, res, ab_cur);
+
+        // int adapter_id = lctx.adapter_ids[0];
+        
+        // if (lctx.lazy_load_lora_adapters[adapter_id]->loaded) {
+        //     auto &lora_adapter =
+        //         lctx.lazy_load_lora_adapters[adapter_id]->adapter;
+        //     struct llama_lora_weight *lora = lora_adapter->get_weight(w);
+
+        //     if (lora != nullptr) {
+        //         struct ggml_tensor *ab_cur =
+        //             ggml_mul_mat(ctx0, lora->b, ggml_mul_mat(ctx0, lora->a, cur));
+        //         res = ggml_add(ctx0, res, ab_cur);
+        //     }
+        // }
+
+        std::unordered_map<int, std::vector<int>> adapter_groups;
+        for (int i = 0; i < n; i++) {
+            int adapter_id = lctx.adapter_ids[i];
+            if (adapter_id > 0) {
+                adapter_groups[adapter_id].push_back(i);
+            }
+        }
+
+        // Process each adapter group
+        for (const auto &group : adapter_groups) {
+            int adapter_id = group.first;
+            const auto &sample_indices = group.second;
+
+            if (!lctx.lazy_load_lora_adapters[adapter_id]->loaded) {
+                continue;
+            }
+
+            auto &lora_adapter =
+                lctx.lazy_load_lora_adapters[adapter_id]->adapter;
+            struct llama_lora_weight *lora = lora_adapter->get_weight(w);
+
+            if (lora == nullptr) {
+                continue;
+            }
+
+            // Create a view for this group's samples
+            struct ggml_tensor *cur_group = ggml_new_tensor_2d(
+                ctx0, cur->type, cur->ne[0], sample_indices.size());
+
+            // Copy relevant samples to the group tensor
+            for (size_t i = 0; i < sample_indices.size(); i++) {
+                int idx = sample_indices[i];
+                struct ggml_tensor *src =
+                    ggml_view_1d(ctx0, cur, cur->ne[0], idx * cur->nb[1]);
+                struct ggml_tensor *dst = ggml_view_1d(
+                    ctx0, cur_group, cur_group->ne[0], i * cur_group->nb[1]);
+                ggml_cpy(ctx0, src, dst);
+            }
+
+            // Apply LoRA adapter to the group
+            struct ggml_tensor *ab_cur_group = ggml_mul_mat(
+                ctx0, lora->b, ggml_mul_mat(ctx0, lora->a, cur_group));
+
+            // Add results back to res tensor
+            for (size_t i = 0; i < sample_indices.size(); i++) {
+                int idx = sample_indices[i];
+                struct ggml_tensor *src =
+                    ggml_view_1d(ctx0, ab_cur_group, ab_cur_group->ne[0],
+                                 i * ab_cur_group->nb[1]);
+                struct ggml_tensor *dst =
+                    ggml_view_1d(ctx0, res, res->ne[0], idx * res->nb[1]);
+                dst = ggml_acc(ctx0, dst, src,
+                               dst->nb[1],  // stride for dim 1
+                               dst->nb[2],  // stride for dim 2
+                               dst->nb[3],  // stride for dim 3
+                               0);          // offset
+            }
+        }
+
+    } else if (lctx.adapter_id > 0) {
+        // LLAMA_LOG_INFO("llm_build_lora_mm: using lora adapter %d\n",
+        // lctx.adapter_id);
+        auto &lora_adapter =
+            lctx.lazy_load_lora_adapters[lctx.adapter_id]->adapter;
+        struct llama_lora_weight *lora = lora_adapter->get_weight(w);
         if (lora != nullptr) {
-            struct ggml_tensor * ab_cur = ggml_mul_mat(
-                ctx0, lora->b,
-                ggml_mul_mat(ctx0, lora->a, cur)
-            );
+            struct ggml_tensor *ab_cur =
+                ggml_mul_mat(ctx0, lora->b, ggml_mul_mat(ctx0, lora->a, cur));
             res = ggml_add(ctx0, res, ab_cur);
         }
     } else {
-        for (auto & it : lctx.lora_adapters) {
-            struct llama_lora_weight * lora = it.first->get_weight(w);
+        for (auto &it : lctx.lora_adapters) {
+            struct llama_lora_weight *lora = it.first->get_weight(w);
             if (lora == nullptr) {
                 continue;
             }
             const float alpha = it.first->alpha;
-            const float rank  = (float) lora->b->ne[0];
+            const float rank = (float)lora->b->ne[0];
             const float scale = alpha ? it.second * alpha / rank : it.second;
-            struct ggml_tensor * ab_cur = ggml_mul_mat(
-                ctx0, lora->b,
-                ggml_mul_mat(ctx0, lora->a, cur)
-            );
+            struct ggml_tensor *ab_cur =
+                ggml_mul_mat(ctx0, lora->b, ggml_mul_mat(ctx0, lora->a, cur));
             ab_cur = ggml_scale(ctx0, ab_cur, scale);
             res = ggml_add(ctx0, res, ab_cur);
         }
@@ -15322,6 +15458,13 @@ static struct ggml_cgraph * llama_build_graph(
 
     llm.init();
 
+    if (batch.adapter_id) {
+        lctx.adapter_ids.clear();
+        for (size_t i = 0; i < batch.n_tokens; ++i) {
+            lctx.adapter_ids.push_back(batch.adapter_id[i]);
+        }
+    }
+
     switch (model.arch) {
         case LLM_ARCH_LLAMA:
             {
@@ -16179,6 +16322,7 @@ static int llama_decode_internal(
                 ubatch = lctx.sbatch.split_equal(n_ubatch);
             }
         } else {
+            // here
             ubatch = lctx.sbatch.split_simple(n_ubatch);
         }
         const uint32_t n_tokens = ubatch.n_tokens;
@@ -16822,7 +16966,7 @@ static void llama_kv_cache_update_internal(struct llama_context & lctx) {
         uint32_t n_seqs = 1; // TODO: worst-case number of sequences
         uint32_t n_tokens = std::min(lctx.cparams.n_ctx, lctx.cparams.n_ubatch);
         llama_token token = llama_token_bos(&lctx.model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
-        llama_ubatch ubatch = { true, n_tokens, n_tokens / n_seqs, n_seqs, &token, nullptr, nullptr, nullptr, nullptr, nullptr};
+        llama_ubatch ubatch = { true, n_tokens, n_tokens / n_seqs, n_seqs, &token, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
         ggml_cgraph * gf = llama_build_graph(lctx, ubatch, true);
 
         // initialize scheduler with the worst-case graph
@@ -17846,6 +17990,7 @@ static void llama_lora_adapter_init_internal(struct llama_model * model, const c
         adapter.bufs.reserve(ctx_map.size());
         for (auto it : ctx_map) {
             ggml_backend_buffer_type_t buft = it.first;
+            // ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
             ggml_context * ctx_dev = it.second;
             ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev, buft);
             if (!buf) {
@@ -17898,61 +18043,86 @@ int32_t llama_lora_adapter_set(
     return 0;
 }
 
-int32_t llama_lora_adapter_idx_set(struct llama_context* ctx,
-                                   int32_t adapter_idx) {
-    if ((int32_t)ctx->lazy_load_lora_adapters.size() <= adapter_idx) {
-        LLAMA_LOG_ERROR("%s: adapter index %d out of range\n", __func__, adapter_idx);
+int32_t llama_lora_adapter_id_set(struct llama_context *ctx,
+                                   int32_t adapter_id) {
+    if ((int32_t)ctx->lazy_load_lora_adapters.size() <= adapter_id) {
+        LLAMA_LOG_ERROR("%s: adapter index %d out of range\n", __func__,
+                        adapter_id);
         return -1;
-    }
-    LLAMA_LOG_INFO("%s: set adapter index %d\n", __func__, adapter_idx);
-    ctx->adapter_idx = adapter_idx;
+    };
+    ctx->adapter_id = adapter_id;
     return 0;
 }
 
+bool llama_lora_adapter_id_append(struct llama_context *ctx,
+                                   int32_t adapter_id) {
+    if (!ctx->batch_lora) {
+        return false;
+    }
+    if ((int32_t)ctx->lazy_load_lora_adapters.size() <= adapter_id) {
+        LLAMA_LOG_ERROR("%s: adapter index %d out of range\n", __func__,
+                        adapter_id);
+        return false;
+    }
+    // LLAMA_LOG_INFO("%s: set adapter index %d\n", __func__, adapter_id);
+    ctx->adapter_ids.push_back(adapter_id);
+    return true;
+}
+
+bool llama_batch_lora_clear(struct llama_context *ctx, int32_t n_parallel) {
+    if (!ctx->batch_lora) {
+        return false;
+    }
+    ctx->adapter_ids.clear();
+    ctx->adapter_ids.reserve(n_parallel);
+    return true;
+}
+
+
 void llama_lora_adapter_release(struct llama_context* ctx,
-                                int32_t adapter_idx) {
-    if ((int32_t)ctx->lazy_load_lora_adapters.size() <= adapter_idx) {
-        LLAMA_LOG_ERROR("%s: adapter index %d out of range\n", __func__, adapter_idx);
+                                int32_t adapter_id) {
+    if ((int32_t)ctx->lazy_load_lora_adapters.size() <= adapter_id) {
+        LLAMA_LOG_ERROR("%s: adapter index %d out of range\n", __func__, adapter_id);
         return;
     }
-    auto* lazy_lora_adapter = ctx->lazy_load_lora_adapters[adapter_idx];
+    auto* lazy_lora_adapter = ctx->lazy_load_lora_adapters[adapter_id];
     lazy_lora_adapter->ref_count--;
-    LLAMA_LOG_INFO("%s: release adapter index %d, reference count %d\n", __func__, adapter_idx, lazy_lora_adapter->ref_count);
+    LLAMA_LOG_INFO("%s: release adapter index %d, reference count %d\n", __func__, adapter_id, lazy_lora_adapter->ref_count);
 }
 
 
 bool llama_lora_adapter_loaded(struct llama_context* ctx,
-                               int32_t adapter_idx){
-    if ((int32_t)ctx->lazy_load_lora_adapters.size() <= adapter_idx) {
-        LLAMA_LOG_ERROR("%s: adapter index %d out of range\n", __func__, adapter_idx);
+                               int32_t adapter_id){
+    if ((int32_t)ctx->lazy_load_lora_adapters.size() <= adapter_id) {
+        LLAMA_LOG_ERROR("%s: adapter index %d out of range\n", __func__, adapter_id);
         return false;
     }
-    auto* lazy_lora_adapter = ctx->lazy_load_lora_adapters[adapter_idx];
+    auto* lazy_lora_adapter = ctx->lazy_load_lora_adapters[adapter_id];
     if (lazy_lora_adapter->loaded) {
-        LLAMA_LOG_INFO("%s: adapter index %d, loaded\n", __func__, adapter_idx);
+        LLAMA_LOG_INFO("%s: adapter index %d, loaded\n", __func__, adapter_id);
     } else {
-        LLAMA_LOG_INFO("%s: adapter index %d, unloaded\n", __func__, adapter_idx);
+        LLAMA_LOG_INFO("%s: adapter index %d, unloaded\n", __func__, adapter_id);
     }
     return lazy_lora_adapter->loaded;
 }
 
 int32_t llama_lazy_load_lora_adapter(struct llama_context* ctx,
-                                     int32_t adapter_idx) {
-    if ((int32_t)ctx->lazy_load_lora_adapters.size() <= adapter_idx) {
-        LLAMA_LOG_ERROR("%s: adapter index %d out of range\n", __func__, adapter_idx);
+                                     int32_t adapter_id) {
+    if ((int32_t)ctx->lazy_load_lora_adapters.size() <= adapter_id) {
+        LLAMA_LOG_ERROR("%s: adapter index %d out of range\n", __func__, adapter_id);
         return -1;
     }
-    auto* lazy_lora_adapter = ctx->lazy_load_lora_adapters[adapter_idx];
+    auto* lazy_lora_adapter = ctx->lazy_load_lora_adapters[adapter_id];
 
     if (lazy_lora_adapter->ref_count > 0) {
-        LLAMA_LOG_INFO("%s: adapter %d already loaded\n", __func__, adapter_idx);
+        LLAMA_LOG_INFO("%s: adapter %d already loaded\n", __func__, adapter_id);
         lazy_lora_adapter->ref_count++;
     } else {
-        LLAMA_LOG_INFO("%s: load adapter %d\n", __func__, adapter_idx);
+        LLAMA_LOG_INFO("%s: load adapter %d\n", __func__, adapter_id);
         lazy_lora_adapter->ref_count = 1;
         // Use LRU to unload unused adapter
         if (ctx->lora_cache != nullptr) {
-            lazy_lora_adapter->adapter = ctx->lora_cache->get((size_t)adapter_idx,
+            lazy_lora_adapter->adapter = ctx->lora_cache->get((size_t)adapter_id,
                                                               &(ctx->model),
                                                               lazy_lora_adapter->path.c_str()).get();
         } else {
@@ -18047,6 +18217,7 @@ struct llama_context_params llama_context_default_params() {
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.adapter_cache_size          =*/ 10,
+        /*.batch_lora                  =*/ false,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.logits_all                  =*/ false,
@@ -18493,6 +18664,7 @@ struct llama_context * llama_new_context_with_model(
 #endif
 
         ctx->lora_cache = new LlamaLoraLRUCache(params.adapter_cache_size, model);
+        ctx->batch_lora = params.batch_lora;
 
         ctx->backend_cpu = ggml_backend_cpu_init();
         if (ctx->backend_cpu == nullptr) {
@@ -18579,7 +18751,7 @@ struct llama_context * llama_new_context_with_model(
             uint32_t n_seqs = 1; // TODO: worst-case number of sequences
             uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
             llama_token token = llama_token_bos(&ctx->model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
-            llama_ubatch ubatch = { true, n_tokens, n_tokens / n_seqs, n_seqs, &token, nullptr, nullptr, nullptr, nullptr, nullptr};
+            llama_ubatch ubatch = { true, n_tokens, n_tokens / n_seqs, n_seqs, &token, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
             ggml_cgraph * gf = llama_build_graph(*ctx, ubatch, true);
 
             // initialize scheduler with the worst-case graph
@@ -18844,22 +19016,22 @@ LlamaLoraLRUCache::LlamaLoraLRUCache(size_t capacity, struct llama_model* model)
     for (size_t i = 0; i < capacity; ++i) {
         memory_pool.push(std::make_shared<llama_lora_adapter>(model));
     }
-};
+}
 
-std::shared_ptr<llama_lora_adapter> LlamaLoraLRUCache::get(size_t adapter_idx, struct llama_model* model, const char* path_lora) {
+std::shared_ptr<llama_lora_adapter> LlamaLoraLRUCache::get(size_t adapter_id, struct llama_model* model, const char* path_lora) {
     // If the adapter is already in the cache, move it to the front
-    if (cache_set.find(adapter_idx) != cache_set.end()) {
+    if (cache_set.find(adapter_id) != cache_set.end()) {
         auto list_it = std::find_if(adapter_cache.begin(), adapter_cache.end(), 
-                                [adapter_idx](const std::pair<size_t, std::shared_ptr<llama_lora_adapter>>& pair) { return pair.first == adapter_idx; });
+                                [adapter_id](const std::pair<size_t, std::shared_ptr<llama_lora_adapter>>& pair) { return pair.first == adapter_id; });
         adapter_cache.splice(adapter_cache.begin(), adapter_cache, list_it);
         return list_it->second;
     }
 
     // If the adapter is not in the cache, create/load it
-    return load_adapter(adapter_idx, model, path_lora);
-};
+    return load_adapter(adapter_id, model, path_lora);
+}
 
-std::shared_ptr<llama_lora_adapter> LlamaLoraLRUCache::load_adapter(size_t adapter_idx, struct llama_model* model, const char* path_lora) {
+std::shared_ptr<llama_lora_adapter> LlamaLoraLRUCache::load_adapter(size_t adapter_id, struct llama_model* model, const char* path_lora) {
     // If we have reached capacity, remove the least recently used adapter
     if (adapter_cache.size() >= capacity) {
         auto lru = adapter_cache.back();
@@ -18881,12 +19053,12 @@ std::shared_ptr<llama_lora_adapter> LlamaLoraLRUCache::load_adapter(size_t adapt
 
     llama_lora_adapter_init_internal(model, path_lora, *adapter);
     auto new_adapter = std::shared_ptr<llama_lora_adapter>(adapter);
-    adapter_cache.emplace_front(adapter_idx, new_adapter);
-    cache_set.insert(adapter_idx);
+    adapter_cache.emplace_front(adapter_id, new_adapter);
+    cache_set.insert(adapter_id);
 
-    LLAMA_LOG_INFO("Loaded adapter with ID: %ld\n", adapter_idx);
+    LLAMA_LOG_INFO("Loaded adapter with ID: %ld\n", adapter_id);
     return new_adapter;
-};
+}
 
 struct llama_lora_adapter * llama_lora_adapter_init(struct llama_model * model, const char * path_lora) {
     try {
@@ -20149,6 +20321,7 @@ struct llama_batch llama_batch_get_one(
         /*n_seq_id       =*/ nullptr,
         /*seq_id         =*/ nullptr,
         /*logits         =*/ nullptr,
+        /*adapter_id     =*/ nullptr,
         /*all_pos_0      =*/ pos_0,
         /*all_pos_1      =*/ 1,
         /*all_seq_id     =*/ seq_id,
@@ -20164,6 +20337,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
         /*n_seq_id       =*/ nullptr,
         /*seq_id         =*/ nullptr,
         /*logits         =*/ nullptr,
+        /*adapter_id     =*/ nullptr,
         /*all_pos_0      =*/ 0,
         /*all_pos_1      =*/ 0,
         /*all_seq_id     =*/ 0,
@@ -20184,6 +20358,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
     batch.seq_id[n_tokens_alloc] = nullptr;
 
     batch.logits   = (int8_t *)        malloc(sizeof(int8_t)         * n_tokens_alloc);
+    batch.adapter_id = (int32_t *) malloc(sizeof(int32_t) * n_tokens_alloc);
 
     return batch;
 }

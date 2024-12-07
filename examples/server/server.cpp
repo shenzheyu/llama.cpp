@@ -115,7 +115,7 @@ struct slot_params {
     int32_t  n_discard =  0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half
     int32_t  n_predict = -1; // new tokens to predict
 
-    int32_t adapter_idx = -1; // lora adapter id (-1 for not using any adapter)
+    int32_t adapter_id = -1; // lora adapter id (-1 for not using any adapter)
 
     std::vector<std::string> antiprompt;
 
@@ -925,7 +925,7 @@ struct server_context {
         slot.sparams.seed              = json_value(data, "seed",              default_sparams.seed);
         slot.sparams.n_probs           = json_value(data, "n_probs",           default_sparams.n_probs);
         slot.sparams.min_keep          = json_value(data, "min_keep",          default_sparams.min_keep);
-        slot.params.adapter_idx        = json_value(data, "adapter_idx",       default_params.adapter_idx);
+        slot.params.adapter_id        = json_value(data, "adapter_id",       default_params.adapter_id);
 
         // process "json_schema" and "grammar"
         if (data.contains("json_schema") && !data.at("json_schema").is_null() && data.contains("grammar") && !data.at("grammar").is_null()) {
@@ -1100,7 +1100,7 @@ struct server_context {
                 llama_batch_clear(batch);
 
                 for (int32_t j = 0; j < n_tokens; ++j) {
-                    llama_batch_add(batch, system_tokens[i + j], i + j, { 0 }, false);
+                    llama_batch_add(batch, system_tokens[i + j], i + j, { 0 }, false, -1);
                 }
 
                 if (llama_decode(ctx, batch) != 0) {
@@ -1373,6 +1373,7 @@ struct server_context {
             {"model",               params.model_alias},
             {"tokens_predicted",    slot.n_decoded},
             {"tokens_evaluated",    slot.n_prompt_tokens},
+            {"first_token_latency", slot.t_first_token},
             {"generation_settings", get_formated_generation(slot)},
             {"prompt",              slot.prompt},
             {"truncated",           slot.truncated},
@@ -1927,7 +1928,10 @@ struct server_context {
         // start populating the batch for this iteration
         llama_batch_clear(batch);
 
-        int32_t current_adapter_idx = -2;
+        // llama_batch_lora_clear(ctx, params.n_batch);
+
+        // track the current adapter_id for sequence adapter
+        int32_t current_adapter_id = -2;
 
         // frist, add sampled tokens from any ongoing sequences
         for (auto & slot : slots) {
@@ -1935,16 +1939,18 @@ struct server_context {
                 continue;
             }
 
-            // make sure adapter_idx consistent in one batch
-            if (current_adapter_idx == -2) {
-                current_adapter_idx = slot.params.adapter_idx;
-                llama_lora_adapter_idx_set(ctx, current_adapter_idx);
-            } else if (current_adapter_idx != slot.params.adapter_idx) {
-                LOG_VERBOSE("adapter_idx inconsistency in one batch", {
-                    {"current_adapter_idx", current_adapter_idx},
-                    {"slot_adapter_idx",    slot.params.adapter_idx}
-                });
-                continue;
+            // make sure adapter_id consistent in one batch
+            if (false) {
+                if (current_adapter_id == -2) {
+                    current_adapter_id = slot.params.adapter_id;
+                    llama_lora_adapter_id_set(ctx, current_adapter_id);
+                } else if (current_adapter_id != slot.params.adapter_id) {
+                    LOG_VERBOSE("adapter_id inconsistency in one batch", {
+                        {"current_adapter_id", current_adapter_id},
+                        {"slot_adapter_id",    slot.params.adapter_id}
+                    });
+                    continue;
+                }
             }
 
             slot.i_batch = batch.n_tokens;
@@ -1953,7 +1959,7 @@ struct server_context {
 
             // TODO: we always have to take into account the "system_tokens"
             //       this is not great and needs to be improved somehow
-            llama_batch_add(batch, slot.sampled, system_tokens.size() + slot_npast, { slot.id + 1 }, true);
+            llama_batch_add(batch, slot.sampled, system_tokens.size() + slot_npast, { slot.id + 1 }, true, slot.params.adapter_id);
 
             slot.n_past += 1;
 
@@ -1989,9 +1995,9 @@ struct server_context {
                     auto & prompt_tokens = slot.prompt_tokens;
 
                     // check if the adapter lora is loaded
-                    if (slot.params.adapter_idx != -1) {
-                        int32_t adapter_idx = slot.params.adapter_idx;
-                        llama_lazy_load_lora_adapter(ctx, adapter_idx);
+                    if (slot.params.adapter_id != -1) {
+                        int32_t adapter_id = slot.params.adapter_id;
+                        llama_lazy_load_lora_adapter(ctx, adapter_id);
                     }
 
                     // we haven't tokenized the prompt yet - do it now:
@@ -2207,7 +2213,7 @@ struct server_context {
                             }
                         }
 
-                        llama_batch_add(batch, prompt_tokens[slot.n_past], system_tokens.size() + slot_npast, { slot.id + 1 }, false);
+                        llama_batch_add(batch, prompt_tokens[slot.n_past], system_tokens.size() + slot_npast, { slot.id + 1 }, false, slot.params.adapter_id);
 
                         if (slot.params.cache_prompt) {
                             slot.cache_tokens.push_back(prompt_tokens[slot.n_past]);
@@ -2305,6 +2311,7 @@ struct server_context {
                 batch.n_seq_id + i,
                 batch.seq_id   + i,
                 batch.logits   + i,
+                batch.adapter_id + i,
                 0, 0, 0, // unused
             };
 
@@ -2353,13 +2360,13 @@ struct server_context {
                         continue; // continue loop of slots
                     }
 
-                    int32_t adapter_idx = slot.params.adapter_idx;
-                    if (adapter_idx != -1) {
-                        if (!llama_lora_adapter_loaded(ctx, adapter_idx)) {
+                    int32_t adapter_id = slot.params.adapter_id;
+                    if (adapter_id != -1) {
+                        if (!llama_lora_adapter_loaded(ctx, adapter_id)) {
                             LOG_ERROR("LORA adapter not loaded", {
                                 {"id_slot", slot.id},
                                 {"id_task", slot.id_task},
-                                {"adapter_idx", adapter_idx}
+                                {"adapter_id", adapter_id}
                             });
                             continue; // continue loop of slots
                         }
@@ -2380,7 +2387,6 @@ struct server_context {
                 if (slot.n_decoded == 1) {
                     slot.t_start_generation = ggml_time_us();
                     slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
-                    slot.t_first_token = (slot.t_first_token - ggml_time_us()) / 1e3;
                     metrics.on_prompt_eval(slot);
                 }
 
@@ -2397,9 +2403,9 @@ struct server_context {
 
                 if (!process_token(result, slot)) {
                     // release slot because of stop condition
-                    int32_t adapter_idx = slot.params.adapter_idx;
-                    if (adapter_idx >= 0) {
-                        llama_lora_adapter_release(ctx, adapter_idx);
+                    int32_t adapter_id = slot.params.adapter_id;
+                    if (adapter_id >= 0) {
+                        llama_lora_adapter_release(ctx, adapter_id);
                     }
                     slot.release();
                     slot.print_timings();
@@ -2408,6 +2414,13 @@ struct server_context {
                 }
 
                 slot.i_batch = -1;
+            }
+
+            // compute the first token latency
+            for (auto & slot : slots) {
+                if (slot.state == SLOT_STATE_GENERATING && slot.n_decoded == 1) {
+                    slot.t_first_token = (ggml_time_us() - slot.t_first_token) / 1e3;
+                }
             }
         }
 

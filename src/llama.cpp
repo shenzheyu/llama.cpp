@@ -4287,7 +4287,7 @@ namespace GGUFMeta {
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
 static size_t llama_model_max_nodes(const llama_model & model) {
-    return std::max<size_t>(8192*10, model.tensors_by_name.size()*10);
+    return std::max<size_t>(8192*20, model.tensors_by_name.size()*20);
 }
 
 struct llama_model_loader {

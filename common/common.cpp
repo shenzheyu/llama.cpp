@@ -2740,6 +2740,7 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         }
         iparams.lora_adapters.push_back(loaded_la); // copy to list of loaded adapters
     }
+    int num_lora = 0;
     for (auto & la : params.repeat_lora_adapters) {
         fprintf(stdout, "repeating LoRA adapter %s %d times\n", la.path.c_str(), la.repeat);
         for (int i = 0; i < la.repeat; i++) {
@@ -2750,8 +2751,21 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
             lazy_la->ref_count = 0;
             iparams.lazy_lora_adapters.emplace_back(lazy_la);
         }
+        num_lora += la.repeat;
     }
     llama_lazy_lora_adapters_register(lctx, iparams.lazy_lora_adapters);
+    if (params.adapter_cache_size > 0) {
+        std::vector<int> adapter_ids;
+        for (int i = 0; i < num_lora; i++) {
+            adapter_ids.push_back(i);
+        }
+        std::random_shuffle(adapter_ids.begin(), adapter_ids.end());
+        for (int i = 0; i < params.adapter_cache_size; i++) {
+            fprintf(stdout, "caching LoRA adapter %d\n", adapter_ids[i]);
+            llama_lazy_load_lora_adapter(lctx, adapter_ids[i]);
+            llama_lora_adapter_release(lctx, adapter_ids[i]);
+        }
+    }
     if (!params.lora_init_without_apply) {
         llama_lora_adapters_apply(lctx, iparams.lora_adapters);
     }

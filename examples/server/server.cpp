@@ -1374,6 +1374,7 @@ struct server_context {
             {"tokens_predicted",    slot.n_decoded},
             {"tokens_evaluated",    slot.n_prompt_tokens},
             {"first_token_latency", slot.t_first_token},
+            {"prompt_process_time", slot.t_prompt_processing},
             {"generation_settings", get_formated_generation(slot)},
             {"prompt",              slot.prompt},
             {"truncated",           slot.truncated},

@@ -244,6 +244,7 @@ struct server_slot {
     void release() {
         if (is_processing()) {
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
+            params.adapter_id = -1;
             state = SLOT_STATE_IDLE;
             LOG_INFO("slot released", {
                 {"id_slot",   id},

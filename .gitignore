@@ -49,7 +49,6 @@ build*
 !build.zig
 !docs/build.md
 /libllama.so
-/llama-*
 /vulkan-shaders-gen
 android-ndk-*
 arm_neon.h

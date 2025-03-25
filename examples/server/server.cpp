@@ -110,6 +110,7 @@ struct server_task_result {
 struct slot_params {
     bool stream       = true;
     bool cache_prompt = false; // remember the prompt to avoid reprocessing all prompt
+    bool adapter_set  = false; // adapter_id is set
 
     int32_t  n_keep    =  0; // number of tokens to keep from initial prompt
     int32_t  n_discard =  0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half
@@ -183,6 +184,8 @@ struct server_slot {
 
     int32_t n_past_se = 0; // self-extend
 
+    float *logits = nullptr;
+
     // stats
     size_t n_sent_text = 0; // number of sent text character
     size_t n_sent_token_probs = 0;
@@ -244,6 +247,7 @@ struct server_slot {
     void release() {
         if (is_processing()) {
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
+            params.adapter_set = false;
             params.adapter_id = -1;
             state = SLOT_STATE_IDLE;
             LOG_INFO("slot released", {
@@ -610,6 +614,56 @@ struct server_response {
         }
     }
 };
+
+
+int get_best_adapter_index_mock(int n_vocab, int n_adapter) {
+    // Seed the random number generator (if not already seeded)
+    srand((unsigned)time(NULL));
+
+    // Initialize ggml context with default parameters
+    size_t compute_size = 1024ll*1024ll*1024ll;
+    uint8_t * compute_addr = new uint8_t[compute_size];
+    struct ggml_init_params params = { compute_size, compute_addr, false };
+    struct ggml_context *ctx = ggml_init(params);
+    if (!ctx) {
+        fprintf(stderr, "Failed to initialize ggml context\n");
+        return -1;
+    }
+
+    // Create a 1D tensor for logits with shape [n_vocab]
+    struct ggml_tensor *logits = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_vocab);
+    float *logits_data = (float *)logits->data;
+    for (int i = 0; i < n_vocab; i++) {
+        logits_data[i] = (float)rand() / RAND_MAX;
+    }
+
+    // Create a 2D tensor for classifier with shape [n_vocab, n_adapter]
+    struct ggml_tensor *classifier = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_vocab, n_adapter);
+    float *classifier_data = (float *)classifier->data;
+    for (int i = 0; i < n_vocab * n_adapter; i++) {
+        classifier_data[i] = (float)rand() / RAND_MAX;
+    }
+
+    struct ggml_tensor *adapter_scores = ggml_mul_mat(ctx, logits, classifier);
+
+    float *adapter_probs_data = (float *)adapter_scores->data;
+
+    // Find the index of the highest probability
+    int best_index = 0;
+    float best_score = adapter_probs_data[0];
+    for (int j = 1; j < n_adapter; j++) {
+        if (adapter_probs_data[j] > best_score) {
+            best_score = adapter_probs_data[j];
+            best_index = j;
+        }
+    }
+
+    // Clean up the ggml context and its associated tensors
+    ggml_free(ctx);
+    delete[] compute_addr;
+
+    return best_index;
+}
 
 struct server_context {
     llama_model * model = nullptr;
@@ -1996,8 +2050,17 @@ struct server_context {
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT) {
                     auto & prompt_tokens = slot.prompt_tokens;
 
+                    if (slot.n_past != 0 && slot.n_past == slot.n_prompt_tokens && !slot.params.adapter_set) {
+                        slot.params.adapter_set = true;
+                        slot.n_past = 0;
+                        int n_vocab = llama_n_vocab(llama_get_model(ctx));
+                        int n_adapter = lazy_lora_adapters.size();
+                        
+                        // slot.params.adapter_id = get_best_adapter_index_mock(n_vocab, n_adapter);
+                    }
+
                     // check if the adapter lora is loaded
-                    if (slot.params.adapter_id != -1) {
+                    if (slot.params.adapter_id != -1 && slot.params.adapter_set) {
                         int32_t adapter_id = slot.params.adapter_id;
                         llama_lazy_load_lora_adapter(ctx, adapter_id);
                     }
@@ -2215,7 +2278,11 @@ struct server_context {
                             }
                         }
 
-                        llama_batch_add(batch, prompt_tokens[slot.n_past], system_tokens.size() + slot_npast, { slot.id + 1 }, false, slot.params.adapter_id);
+                        if (slot.params.adapter_set) {
+                            llama_batch_add(batch, prompt_tokens[slot.n_past], system_tokens.size() + slot_npast, { slot.id + 1 }, false, slot.params.adapter_id);
+                        } else {
+                            llama_batch_add(batch, prompt_tokens[slot.n_past], system_tokens.size() + slot_npast, { slot.id + 1 }, false, -1);
+                        }
 
                         if (slot.params.cache_prompt) {
                             slot.cache_tokens.push_back(prompt_tokens[slot.n_past]);
@@ -2234,7 +2301,7 @@ struct server_context {
                     });
 
                     // entire prompt has been processed
-                    if (slot.n_past == slot.n_prompt_tokens) {
+                    if (slot.n_past == slot.n_prompt_tokens && slot.params.adapter_set) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
 
                         GGML_ASSERT(batch.n_tokens > 0);
@@ -2252,6 +2319,10 @@ struct server_context {
                             {"n_tokens", batch.n_tokens},
                         });
                     }
+
+                    // if (slot.n_past == slot.n_prompt_tokens && !slot.params.adapter_set) {
+                    //     slot.n_past = 0;
+                    // }
                 }
 
                 if (batch.n_tokens >= n_batch) {
@@ -2418,10 +2489,16 @@ struct server_context {
                 slot.i_batch = -1;
             }
 
-            // compute the first token latency
             for (auto & slot : slots) {
+                // compute the first token latency
                 if (slot.state == SLOT_STATE_GENERATING && slot.n_decoded == 1) {
                     slot.t_first_token = (ggml_time_us() - slot.t_first_token) / 1e3;
+                }
+                // set the logits for adapter selection
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                    if (!slot.params.adapter_set) {
+                        slot.logits = llama_get_logits_ith(ctx, slot.i_batch - i);
+                    }
                 }
             }
         }

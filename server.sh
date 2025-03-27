@@ -28,7 +28,7 @@ case $MODEL in
         fi
         
         echo "Starting OpenELM-1.1B server with $LORA_COUNT LoRAs (adapter cache: $ADAPTER_CACHE)..."
-        ./llama-server -m /home/zheyu/code/llama.cpp/models/OpenELM-1_1B-GGUF/Q4_0/Q4_0-00001-of-00001.gguf -c 25600 --lora_repeated /home/zheyu/code/llama.cpp/models/aac/lora.gguf $LORA_COUNT --adapter_cache_size $ADAPTER_CACHE --parallel 60 --batch_lora true --n-gpu-layers 999
+        ./llama-server -m ./models/OpenELM-1.1B/Q4_0-00001-of-00001.gguf -c 25600 --lora_repeated ./models/aac/lora.gguf $LORA_COUNT --adapter_cache_size $ADAPTER_CACHE --parallel 60 --batch_lora true --n-gpu-layers 999
         ;;
     Llama3.2-3B)
         # Set adapter_cache_size to LORA_COUNT if LORA_COUNT is smaller
@@ -38,7 +38,7 @@ case $MODEL in
         fi
         
         echo "Starting Llama3.2-3B server with $LORA_COUNT LoRAs (adapter cache: $ADAPTER_CACHE)..."
-        ./llama-server -m /home/zheyu/code/llama.cpp/models/Llama-Sentient-3.2-3B-Instruct-GGUF/Llama-Sentient-3.2-3B-Instruct.Q4_0.gguf -c 51200 --lora_repeated /home/zheyu/code/llama.cpp/models/Meta-Llama-3.2-3B-MEDAL-finetune/Meta-Llama-3.2-3B-MEDAL-finetune-F16-LoRA.gguf $LORA_COUNT --adapter_cache_size $ADAPTER_CACHE --parallel 40 --batch_lora true --n-gpu-layers 999
+        ./llama-server -m ./models/Llama3.2-3B/Llama-Sentient-3.2-3B-Instruct.Q4_0.gguf -c 51200 --lora_repeated ./models/Llama3.2-3B/Meta-Llama-3.2-3B-MEDAL-finetune-F16-LoRA.gguf $LORA_COUNT --adapter_cache_size $ADAPTER_CACHE --parallel 40 --batch_lora true --n-gpu-layers 999
         ;;
     Llama3.1-8B)
         # Set adapter_cache_size to LORA_COUNT if LORA_COUNT is smaller
@@ -48,7 +48,7 @@ case $MODEL in
         fi
         
         echo "Starting Llama3.1-8B server with $LORA_COUNT LoRAs (adapter cache: $ADAPTER_CACHE)..."
-        ./llama-server -m /home/zheyu/code/llama.cpp/models/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-Q8_0.gguf -c 102400 --lora_repeated /home/zheyu/code/llama.cpp/models/Llama-3_1-8B-Instruct-orca-ORPO/Llama-8B-3_1-Instruct-orca-ORPO-F16-LoRA.gguf $LORA_COUNT --adapter_cache_size $ADAPTER_CACHE --parallel 20 --batch_lora true --n-gpu-layers 999
+        ./llama-server -m ./models/Llama3.1-8B/Meta-Llama-3.1-8B-Instruct-Q8_0.gguf -c 102400 --lora_repeated ./models/Llama3.1-8B/Llama-8B-3_1-Instruct-orca-ORPO-F16-LoRA.gguf $LORA_COUNT --adapter_cache_size $ADAPTER_CACHE --parallel 20 --batch_lora true --n-gpu-layers 999
         ;;
     *)
         echo "Invalid model selection: $MODEL"

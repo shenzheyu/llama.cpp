@@ -632,31 +632,15 @@ int get_best_adapter_index_mock(int n_vocab, int n_adapter) {
 
     // Create a 1D tensor for logits with shape [n_vocab]
     struct ggml_tensor *logits = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_vocab);
-    float *logits_data = (float *)logits->data;
-    for (int i = 0; i < n_vocab; i++) {
-        logits_data[i] = (float)rand() / RAND_MAX;
-    }
 
     // Create a 2D tensor for classifier with shape [n_vocab, n_adapter]
     struct ggml_tensor *classifier = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_vocab, n_adapter);
-    float *classifier_data = (float *)classifier->data;
-    for (int i = 0; i < n_vocab * n_adapter; i++) {
-        classifier_data[i] = (float)rand() / RAND_MAX;
-    }
 
     struct ggml_tensor *adapter_scores = ggml_mul_mat(ctx, logits, classifier);
+    struct ggml_tensor* argmax_tensor = ggml_argmax(ctx, adapter_scores);
 
-    float *adapter_probs_data = (float *)adapter_scores->data;
-
-    // Find the index of the highest probability
-    int best_index = 0;
-    float best_score = adapter_probs_data[0];
-    for (int j = 1; j < n_adapter; j++) {
-        if (adapter_probs_data[j] > best_score) {
-            best_score = adapter_probs_data[j];
-            best_index = j;
-        }
-    }
+    // Extract the integer index from the returned scalar tensor.
+    int best_index = ggml_get_i32_1d(argmax_tensor, 0);
 
     // Clean up the ggml context and its associated tensors
     ggml_free(ctx);
@@ -2056,7 +2040,7 @@ struct server_context {
                         int n_vocab = llama_n_vocab(llama_get_model(ctx));
                         int n_adapter = lazy_lora_adapters.size();
                         
-                        // slot.params.adapter_id = get_best_adapter_index_mock(n_vocab, n_adapter);
+                        slot.params.adapter_id = get_best_adapter_index_mock(n_vocab, n_adapter);
                     }
 
                     // check if the adapter lora is loaded
